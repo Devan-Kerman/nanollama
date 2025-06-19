@@ -1,6 +1,10 @@
 import re
+from flax import nnx
 
-from .config import *
+from flax.core import FrozenDict
+from ueaj.model.ueajsum.config import (
+    UeajsumConfig, ArgumentConfig, ParamConfig
+)
 
 SPECIAL_SYMBOLS = {
 	"*": nnx.Param,
@@ -26,6 +30,7 @@ def parse(expr, no_instantiation: bool = False, *args, **kwargs) -> UeajsumConfi
 	kwargs = dict(kwargs)
 	args = list(args)
 
+	c = 0
 	access_specs = []
 	for term in sums:
 		access_spec = []
@@ -69,9 +74,14 @@ def parse(expr, no_instantiation: bool = False, *args, **kwargs) -> UeajsumConfi
 					raise ValueError(f"Instantiation not allowed!")
 
 				shape = arg
-				idx = len(args)
-				args.append(_make_default(shape, group))
-				access_spec.append(idx)
+				while c < len(args) and args[c] is not None:
+					c += 1
+				if c >= len(args):
+					args.append(_make_default(shape, group))
+				else:
+					args[c] = _make_default(shape, group)
+
+				access_spec.append(c)
 
 		access_specs.append(tuple(access_spec))
 
@@ -83,7 +93,7 @@ def parse(expr, no_instantiation: bool = False, *args, **kwargs) -> UeajsumConfi
 			if isinstance(spec, str):
 				raise ValueError(f"Unknown argument: {spec} in '{expr}'")
 			elif isinstance(spec, int):
-				if spec >= len(args):
+				if spec >= len(args) or args[spec] is None:
 					raise ValueError(f"Index out of bounds: {spec} in '{expr}'")
 
 	return UeajsumConfig(

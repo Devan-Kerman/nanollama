@@ -33,12 +33,6 @@ def make_config(name: str, default: T, *args, **kwargs) -> Value[T]:
 	return holder
 
 backend = jax.default_backend()
-DEFAULT_FP8_PROMO_TYPE = make_config(
-	'default_fp8_promotion_type',
-	jax.dtypes.canonicalize_dtype(os.environ.get('DEFAULT_F8_PROMO_TYPE', jnp.bfloat16 if backend == 'tpu' else jnp.float16)),
-	help='Set the default float8 promotion type for when promotion is needed.'
-)
-
 DEFAULT_ACCUM_TYPE = make_config(
 	'default_accumulation_type',
 	jax.dtypes.canonicalize_dtype(os.environ.get('DEFAULT_ACCUM_TYPE', jnp.bfloat16 if backend == 'tpu' else jnp.float32)),

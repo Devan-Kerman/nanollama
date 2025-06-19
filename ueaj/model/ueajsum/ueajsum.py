@@ -10,14 +10,15 @@ import jax
 from flax import nnx
 from flax.nnx import rnglib as rng
 
-from . import config as cfg, parser
-from .mixsum import mixsum
+from ueaj.model.ueajsum import config as cfg
+from ueaj.model.ueajsum import parser
+from ueaj.model.ueajsum.mixsum import mixsum
 
 class Ueajsum(nnx.Module):
 	def __init__(self, config: cfg.UeajsumConfig, shape_map: Mapping[str, int], rngs: rng.Rngs):
 		super().__init__()
 
-		self._default = config
+		self.config = config
 
 		for k, v in config.kwarg_configs.items():
 			if isinstance(v, cfg.ParamConfig):
@@ -33,10 +34,16 @@ class Ueajsum(nnx.Module):
 
 
 	def __call__(self, *args, **kwargs):
-		return self.invoke(self._default, False, *args, **kwargs)
+		return self.invoke(self.config, False, *args, **kwargs)
 
 	def parse(self, expr: str) -> cfg.UeajsumConfig:
-		return parser.parse(expr, no_instantiation=True, **self._default_arg_dict(pairs=False))
+		kwargs = self._default_arg_dict(pairs=False)
+		args = [None] * (max([i for i in kwargs.keys() if isinstance(i, int)])+1)
+		for k, v in dict(kwargs).items():
+			if isinstance(k, int):
+				args[k] = v
+				del kwargs[k]
+		return parser.parse(expr, True, *args, **kwargs)
 
 	def parse_and_call(self, expr: str, *args, **kwargs):
 		return self.invoke(self.parse(expr), False, *args, **kwargs)
@@ -79,16 +86,63 @@ class Ueajsum(nnx.Module):
 
 		return accumulator
 
+	def get_argument_axes_info(self, terms: cfg.UeajsumConfig = None):
+		"""
+		Determines the reducing and non-reducing axes for each argument
+		based on a Ueajsum configuration.
+
+		Args:
+			terms: A UeajsumConfig object. If None, `self.config` is used.
+
+		Returns:
+			A dictionary mapping each argument identifier (int for positional,
+			str for keyword) to a dictionary containing:
+			- 'reducing_axes': A sorted list of axes that are reduced.
+			- 'non_reducing_axes': A sorted list of axes that are not reduced.
+		"""
+		if terms is None:
+			terms = self.config
+
+		arg_configs = {}
+		for i, term_config in enumerate(terms.arg_configs):
+			if term_config:
+				arg_configs[i] = term_config
+		for k, term_config in terms.kwarg_configs.items():
+			if term_config:
+				arg_configs[k] = term_config
+
+		output_axes = set(terms.result_config.shape)
+		axes_info = {}
+
+		for arg_ref, arg_config in arg_configs.items():
+			arg_shape_axes = set(arg_config.shape)
+			
+			non_reducing = arg_shape_axes.intersection(output_axes)
+			reducing = arg_shape_axes.difference(output_axes)
+
+			axes_info[arg_ref] = {
+				'reducing_axes': reducing,
+				'non_reducing_axes': non_reducing,
+			}
+			
+		return axes_info
+
 	def _default_arg_dict(self, pairs: bool = True):
 		arg_dict = {}
 
-		for k, v in enumerate(self._default.arg_configs):
+		for k, v in enumerate(self.config.arg_configs):
 			if isinstance(v, cfg.ParamConfig):
-				arg_dict[k] = (getattr(self, f"w_{k}"), v) if pairs else v
+				param = getattr(self, f"w_{k}")
+				# Extract value from nnx.Param if needed
+				param_value = param.value if hasattr(param, 'value') else param
+				arg_dict[k] = (param_value, v) if pairs else v
 
-		for k, v in self._default.kwarg_configs.items():
+		for k, v in self.config.kwarg_configs.items():
 			if isinstance(v, cfg.ParamConfig):
-				arg_dict[k] = (getattr(self, k), v) if pairs else v
+				param = getattr(self, k)
+				# Extract value from nnx.Param if needed
+				param_value = param.value if hasattr(param, 'value') else param
+				arg_dict[k] = (param_value, v) if pairs else v
 
 		return arg_dict
 
@@ -105,6 +159,8 @@ class Ueajsum(nnx.Module):
 			arg_dict[k] = (v, None)
 
 		for k, v in itertools.chain(enumerate(terms.arg_configs), terms.kwarg_configs.items()):
+			if v is None:
+				continue
 			if k not in arg_dict:
 				raise ValueError(f"Missing argument {k}")
 			entry = arg_dict[k]

@@ -1,1 +1,1 @@
-from .model import *
+# Main package for ueaj (Unique Einstein Attention JAX Sum)

@@ -1,6 +1,10 @@
 import pytest
+from flax.core import FrozenDict
 
 from ueaj.model.ueajsum import *
+from flax import nnx
+import jax
+import jax.numpy as jnp
 
 def get_rngs():
 	return nnx.Rngs(0)
@@ -218,7 +222,7 @@ def test_everything():
 	model = Ueajsum(
 		parse("ij,*w=jk + *b=k -> ik")
 			.fp8_params()
-			.group_map(dtype(jnp.float8_e4m3fn), nnx.LoRAParam)
+			.group_map(jax.dtype(jnp.float8_e4m3fn), nnx.LoRAParam)
 			.unit()
 			.fp32_grads()
 			.map_arg('b', lambda c: c.with_initializer(nnx.initializers.zeros)),

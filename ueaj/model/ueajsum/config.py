@@ -67,7 +67,7 @@ class ParamConfig(ArgumentConfig):
 	group: Type[nnx.Variable] = nnx.Param
 	_initializer: inits.Initializer | None = None
 
-	def with_group(self, group: nnx.Variable) -> "ParamConfig":
+	def with_group(self, group: Type[nnx.Variable]) -> "ParamConfig":
 		"""Return a param config with the same attributes but a different group."""
 		return replace(self, group=group)
 
@@ -88,7 +88,7 @@ class ParamConfig(ArgumentConfig):
 			if self.variance is not None:
 				return inits.normal(stddev=jnp.sqrt(self.variance))
 			else:
-				return inits.lecun_normal()
+				return inits.lecun_normal(in_axis=0)
 		return self._initializer
 
 def group_filter(group: nnx.Variable | Sequence[nnx.Variable] | None | Callable[..., bool]):
@@ -123,7 +123,7 @@ class UeajsumConfig:
 
 	sums: SUMMATIONS
 
-	def map_arg(self, arg: str | int | Sequence[str | int], fn):
+	def map_arg(self, arg: str | int | Sequence[str | int], fn: Callable[[ArgumentConfig | ParamConfig], ArgumentConfig | ParamConfig]):
 		if isinstance(arg, str) and arg in self.kwarg_configs:
 			current = dict(self.kwarg_configs)
 			current[arg] = fn(current[arg])

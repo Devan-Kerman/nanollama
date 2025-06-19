@@ -3,10 +3,11 @@ from functools import reduce
 from operator import mul, or_
 from typing import Sequence, Optional, Counter, Tuple, List
 
+import jax.dtypes
 import jax.numpy as jnp
 from jax import lax
 from jax.typing import DTypeLike
-from ueaj import utils
+from ueaj.utils.argutils import promote_fp8
 
 def accumulation_type(precision, result_type):
 	if isinstance(precision, lax.DotAlgorithm):
@@ -63,7 +64,7 @@ def var_einsum(
 	input_var: Optional[Sequence[float]] = None,
 	einsum_kwargs: EinsumKwargs
 ) -> jnp.ndarray:
-	operands = utils.promote_fp8(*operands)
+	operands = promote_fp8(*operands)
 
 	if input_var is None or all(v is None for v in input_var) or len(operands) == 0:
 		return jnp.einsum(expr, *operands, **einsum_kwargs.ein_kwargs())
