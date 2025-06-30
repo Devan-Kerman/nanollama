@@ -1,3 +1,4 @@
+import itertools
 import os
 from operator import mul
 
@@ -26,6 +27,27 @@ import gc
 from jax import numpy as jnp
 import optax
 
+@nnx.jit
+def test(
+	model: model.LlamaModel,
+	inputs: jax.Array,
+	document_ids: Optional[jax.Array] = None,
+	pad_token_id: Optional[int] = None
+):
+	kwargs: dict[str, Any] = {}  # {'implementation': 'cudnn'}
+	kwargs['sequence_descriptor'] = SequenceDescriptor.from_seqlens((inputs != pad_token_id).sum(axis=1))
+	activations = model.get_activations(inputs, **kwargs)
+
+	token_loss, loss_mask = chunked_softmax_cross_entropy(
+		inputs,
+		activations,
+		model.get_logits,
+		document_ids=document_ids,
+		pad_token_id=pad_token_id,
+		return_loss_mask=True
+	)
+	mask = loss_mask.sum(dtype=jnp.float32)
+	return token_loss.sum() / mask.sum()
 
 @nnx.value_and_grad(has_aux=True)
 def grad(
@@ -49,7 +71,7 @@ def grad(
 	mask = loss_mask.sum(dtype=jnp.float32)
 	return token_loss.sum() / jnp.sqrt(mask), (token_loss.mean(), token_loss.std())
 
-main_optimizer = optax.lion(learning_rate=1e-4, b1=1, b2=.995, weight_decay=1e-3)
+main_optimizer = optax.lion(learning_rate=1e-2, b1=1, b2=.9, weight_decay=1e-2)
 
 def k_eff(W):
 	if W.ndim < 2:
@@ -134,24 +156,41 @@ def tokenize(examples):
 	return {'tokens': tokenized}
 
 
-dataset = dataset.map(tokenize, batched=True)
-dataset = dataset.select_columns("tokens")
-
-
 def tokens(dataset):
 	for ex in dataset:
 		yield np.array(ex["tokens"], dtype=np.int32)
+def cycle(dataset):
+	while True:
+		yield from dataset
+		print("\n\nCycled!!!!!!!\n\n")
 
 
-batch_size, seq_len = 24, 2048
-dataset = data.pack_documents(tokens(dataset), max_length=seq_len, min_fill_ratio=.99, pad_token_id=pad_token)
-dataset = data.batch_iterator(dataset, batch_size=batch_size, drop_last=True, collate_fn=data.tuple_collate)
-dataset = data.device_prefetch(dataset, buffer_size=100)
+
+batch_size, seq_len = 12, 4096
+
+dataset = dataset.map(tokenize, batched=True)
+dataset = dataset.select_columns("tokens")
+test_ds = list(dataset.skip(10_000).take(1000))
+dataset = dataset.take(10_000)
+def chunkify(dataset):
+	dataset = cycle(dataset)
+	dataset = tokens(dataset)
+	dataset = data.pack_documents(dataset, max_length=seq_len, min_fill_ratio=.99, pad_token_id=pad_token)
+	dataset = data.batch_iterator(dataset, batch_size=batch_size, drop_last=True, collate_fn=data.tuple_collate)
+	dataset = data.device_prefetch(dataset, buffer_size=100)
+	return dataset
+
+dataset = chunkify(dataset)
+test_data = next(chunkify(test_ds))
+
 tokens = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
 document_ids = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
 
 print("Loading model...")
 tensor_config = model.ParamConfig("", group=nnx.Param).with_dtype(jnp.bfloat16)
+def leaky_relu_sq(x):
+	return jnp.where(x < 0, -.0625, 1) * jnp.square(x)
+
 config = model.LlamaConfig(
 	vocab_size=128256,
 	model_d=768,
@@ -168,13 +207,14 @@ config = model.LlamaConfig(
 			kv_heads=6,
 			kv_q_ratio=2,
 			rope_theta=10_000.0,
-			param_config=tensor_config
+			param_config=tensor_config,
+			act_fn=leaky_relu_sq
 		),
 		mlp_config=model.MLPConfig(
 			model_d=768,
 			hidden_d=768*4,
 			param_config=tensor_config,
-			activation_fn=lambda x: jnp.where(x < 0, -.0625, 1) * x * x
+			activation_fn=leaky_relu_sq
 		),
 		norm_config=model.RMSNormConfig(
 			model_d=768,
@@ -227,29 +267,19 @@ if cost is not None:
 	print(f"Parameter VRAM:		{cost.output_size_in_bytes * 1e-9:.2f}GB")
 	print(f"Total VRAM:			{cost.temp_size_in_bytes * 1e-9 + cost.output_size_in_bytes * 1e-9:.2f}GB")
 
-phases = {
-	0: (2e-4, .99),
-	100: (1e-4, .995),
-	4000: (4e-5, .999),
-	10_000: (2e-5, .9995),
-}
+lr, n, k_eff, scale = 1e-3, 10, 0, 0
 print("Starting training...")
 for i, batch in enumerate(dataset):
 	tokens, doc_ids = batch
 	if i == 0:
 		gc.collect()
 
-	c = i
-	lr, mom = phases[0]
-	for k, v in phases.items():
-		if c >= k:
-			lr, mom = v
-			c = k
-
 	start_train = time.time()
 	state, opt_state, (mean_loss, std_loss, stats, k_eff_mom, k_eff_par) = train_step(
-		graph_def, state, opt_state, tokens, document_ids=doc_ids, pad_token_id=pad_token, lr=lr, mom=mom
+		graph_def, state, opt_state, tokens, document_ids=doc_ids, pad_token_id=pad_token, lr=lr / n, mom=1 - 1/n
 	)
+
+	model = nnx.merge(graph_def, state)
 
 	dataset.send(None)
 	gc.collect()
@@ -258,7 +288,21 @@ for i, batch in enumerate(dataset):
 	mean_loss = mean_loss.block_until_ready()
 	end_wait = time.time()
 
+	t_loss = test(model, test_data[0], test_data[1], pad_token)
+
 	train_time, wait_time = end_wait - start_train, end_wait - start_wait
+
+	new_k_eff = k_eff_mom.mlp.up_proj.w_1.value.mean()
+	if jnp.isnan(new_k_eff):
+		print("[Warn] NaN detected in k_eff!")
+	elif i < 10:
+		diff = new_k_eff - k_eff
+		scale = .9 * scale + .1 * diff**2
+	else:
+		diff = new_k_eff - k_eff
+		scale = .9 * scale + .1 * diff**2
+		n = max(n + jnp.clip(diff / jnp.sqrt(max(scale, 1e-3)), -2, 2) + .01, 10.0)
+		k_eff = new_k_eff
 
 	if wait_time < .01:
 		print("[Warn] Training is outpacing data loading!")
@@ -268,10 +312,14 @@ for i, batch in enumerate(dataset):
 
 	wandb_dict = {
 		"step": i,
-		"loss": float(mean_loss),
+		"train_loss": float(mean_loss),
+		"test_loss": float(t_loss),
 		"std_loss": float(std_loss),
 		"train_time": train_time,
 		"wait_time": wait_time,
+		"effective_batch_size": n,
+		"learning_rate": lr / n,
+		"momentum": 1 - 1/n
 	}
 	for key, value in nnx.to_flat_state(k_eff_mom):
 		wandb_dict["k_eff-mom-" + ".".join(key)] = value.value.mean()
@@ -283,7 +331,7 @@ for i, batch in enumerate(dataset):
 		wandb_dict["gnorm-" + ".".join(key)] = value.value.mean()
 
 	wandb.log(wandb_dict)
-	print(f"[{i}] Mean loss: {float(mean_loss):.2f}, Std loss: {float(std_loss):.2f}")
+	print(f"[{i}] Test loss: {float(t_loss):.2f}, Train loss: {float(mean_loss):.2f}, Std loss: {float(std_loss):.2f}, Effective batch size: {n:.1f}, Learning rate: {lr / n:.2e}, Momentum: {1 - 1/n:.2f}")
 	if np.isnan(mean_loss):
 		print("Loss is NaN, stopping training...")
 		break

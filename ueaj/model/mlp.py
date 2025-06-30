@@ -5,7 +5,7 @@ import jax
 from jax import numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib as rng
-from ueaj.model import ueajsum as us, RMSNorm
+from ueaj.model import ueajsum as us
 from ueaj.utils.argutils import either
 from ueaj.utils.collections import LOW_PRECISION
 from ueaj.utils.gradutils import debug_dtype
@@ -110,31 +110,32 @@ class GMLP(nnx.Module):
 
 	# todo manual backprop implementation
 
-def bwd(mlp: GMLP, x: jax.Array, dx: jax.Array, rms: RMSNorm | None = None):
-	x2 = rms(x) if rms else x
-
-	fused = mlp.fused_proj(x2)
-	up, gate = fused
-
-	if x.dtype not in LOW_PRECISION:
-		gx = up * mlp.activation_fn(gate)
-	else:
-		s = jnp.max(jnp.abs(up), axis=(0, 1), keepdims=True) + 1
-		gx = (s * up) * mlp.activation_fn(gate)
-		gx = x / s
-
-	del up
-	dmlp, (dgx) = mlp.down_proj.parse_and_bwd("bnh,[1]->bnd", gx)
-
-	del gx
-
-	gate_a = mlp.activation_fn(gate)
-	dup = dgx * gate_a
-
-	# todo unfused transpose
-
-
-	return x
+# from ueaj.model import RMSNorm
+# def bwd(mlp: GMLP, x: jax.Array, dx: jax.Array, rms: 'RMSNorm' | None = None):
+# 	x2 = rms(x) if rms else x
+#
+# 	fused = mlp.fused_proj(x2)
+# 	up, gate = fused
+#
+# 	if x.dtype not in LOW_PRECISION:
+# 		gx = up * mlp.activation_fn(gate)
+# 	else:
+# 		s = jnp.max(jnp.abs(up), axis=(0, 1), keepdims=True) + 1
+# 		gx = (s * up) * mlp.activation_fn(gate)
+# 		gx = x / s
+#
+# 	del up
+# 	dmlp, (dgx) = mlp.down_proj.parse_and_bwd("bnh,[1]->bnd", gx)
+#
+# 	del gx
+#
+# 	gate_a = mlp.activation_fn(gate)
+# 	dup = dgx * gate_a
+#
+# 	# todo unfused transpose
+#
+#
+# 	return x
 
 if __name__ == "__main__":
 	config = MLPConfig(

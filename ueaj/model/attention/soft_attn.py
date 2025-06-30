@@ -2,6 +2,7 @@ from abc import ABC
 from abc import ABC
 from dataclasses import dataclass, replace
 from math import ceil
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +34,8 @@ class AttentionConfig:
 	window_size: int | None = None
 
 	param_config: us.ParamConfig = us.ParamConfig("", group=nnx.Param)
+
+	act_fn: Callable[[jax.Array], jax.Array] | None = None
 
 	_k_config: us.ParamConfig | None = None
 	_v_config: us.ParamConfig | None = None
@@ -208,6 +211,8 @@ class SoftmaxAttention(nnx.Module, ABC):
 		# 	query=q_reshaped, key=k, value=v, is_causal=True, **attn_kwargs
 		# )
 		out = out.reshape(b, n, h, i, self.config.v_head_d)
+		if self.config.act_fn is not None:
+			out = self.config.act_fn(out)
 		y = self.o(out)
 		return y
 
