@@ -71,7 +71,7 @@ def grad(
 	mask = loss_mask.sum(dtype=jnp.float32)
 	return token_loss.sum() / jnp.sqrt(mask), (token_loss.mean(), token_loss.std())
 
-main_optimizer = optax.lion(learning_rate=1e-2, b1=1, b2=.9, weight_decay=1e-2)
+main_optimizer = optax.lion(learning_rate=1e-3, b1=1, b2=.9, weight_decay=1e-2)
 
 def k_eff(W):
 	if W.ndim < 2:
@@ -136,8 +136,9 @@ import transformers
 model_name = "meta-llama/Llama-3.2-1B"
 
 print("Loading tokenizer...")
-tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(model_name)
-pad_token = tokenizer.get_vocab()["<|finetune_right_pad_id|>"]
+tokenizer = transformers.GPT2TokenizerFast.from_pretrained("openai-community/gpt2")
+tokenizer.max_length = 1024*100
+pad_token = 65535
 
 print("Vocab Size:", tokenizer.vocab_size)
 
@@ -159,21 +160,13 @@ def tokenize(examples):
 def tokens(dataset):
 	for ex in dataset:
 		yield np.array(ex["tokens"], dtype=np.int32)
-def cycle(dataset):
-	while True:
-		yield from dataset
-		print("\n\nCycled!!!!!!!\n\n")
-
-
 
 batch_size, seq_len = 12, 4096
 
 dataset = dataset.map(tokenize, batched=True)
 dataset = dataset.select_columns("tokens")
-test_ds = list(dataset.skip(10_000).take(1000))
-dataset = dataset.take(10_000)
+test_ds = itertools.cycle(dataset.take(1000))
 def chunkify(dataset):
-	dataset = cycle(dataset)
 	dataset = tokens(dataset)
 	dataset = data.pack_documents(dataset, max_length=seq_len, min_fill_ratio=.99, pad_token_id=pad_token)
 	dataset = data.batch_iterator(dataset, batch_size=batch_size, drop_last=True, collate_fn=data.tuple_collate)
@@ -182,6 +175,7 @@ def chunkify(dataset):
 
 dataset = chunkify(dataset)
 test_data = next(chunkify(test_ds))
+del test_ds
 
 tokens = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
 document_ids = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
@@ -192,7 +186,7 @@ def leaky_relu_sq(x):
 	return jnp.where(x < 0, -.0625, 1) * jnp.square(x)
 
 config = model.LlamaConfig(
-	vocab_size=128256,
+	vocab_size=65536,
 	model_d=768,
 	num_layers=12,
 	tensor_config=tensor_config,
@@ -226,7 +220,6 @@ config = model.LlamaConfig(
 		scale="centered"
 	)
 )
-# config = model.LlamaConfig.from_pretrained(model_name).with_tied(False)
 model = model.LlamaModel(config, rngs=rng.Rngs(0))
 
 graph_def, state = nnx.split(model, nnx.Param)
@@ -276,19 +269,15 @@ for i, batch in enumerate(dataset):
 
 	start_train = time.time()
 	state, opt_state, (mean_loss, std_loss, stats, k_eff_mom, k_eff_par) = train_step(
-		graph_def, state, opt_state, tokens, document_ids=doc_ids, pad_token_id=pad_token, lr=lr / n, mom=1 - 1/n
+		graph_def, state, opt_state, tokens, document_ids=doc_ids, pad_token_id=pad_token, lr=lr/n, mom=1 - 1/n
 	)
-
-	model = nnx.merge(graph_def, state)
 
 	dataset.send(None)
 	gc.collect()
 
 	start_wait = time.time()
-	mean_loss = mean_loss.block_until_ready()
+	mean_loss.block_until_ready()
 	end_wait = time.time()
-
-	t_loss = test(model, test_data[0], test_data[1], pad_token)
 
 	train_time, wait_time = end_wait - start_train, end_wait - start_wait
 
@@ -300,20 +289,16 @@ for i, batch in enumerate(dataset):
 		scale = .9 * scale + .1 * diff**2
 	else:
 		diff = new_k_eff - k_eff
-		scale = .9 * scale + .1 * diff**2
+		scale = .95 * scale + .05 * diff**2
 		n = max(n + jnp.clip(diff / jnp.sqrt(max(scale, 1e-3)), -2, 2) + .01, 10.0)
 		k_eff = new_k_eff
 
 	if wait_time < .01:
 		print("[Warn] Training is outpacing data loading!")
 
-	if i % 10 == 0:
-		print(f"Train time: {train_time:.2f}s, Wait time: {wait_time:.2f}s")
-
 	wandb_dict = {
 		"step": i,
 		"train_loss": float(mean_loss),
-		"test_loss": float(t_loss),
 		"std_loss": float(std_loss),
 		"train_time": train_time,
 		"wait_time": wait_time,
@@ -321,6 +306,14 @@ for i, batch in enumerate(dataset):
 		"learning_rate": lr / n,
 		"momentum": 1 - 1/n
 	}
+
+	if i % 25 == 0:
+		model = nnx.merge(graph_def, state)
+		t_loss = test(model, test_data[0], test_data[1], pad_token)
+		wandb_dict["test_loss"] = float(t_loss)
+		print(f"Test loss: {float(t_loss):.2f}, Train time: {train_time:.2f}s, Wait time: {wait_time:.2f}s")
+
+
 	for key, value in nnx.to_flat_state(k_eff_mom):
 		wandb_dict["k_eff-mom-" + ".".join(key)] = value.value.mean()
 
@@ -331,7 +324,7 @@ for i, batch in enumerate(dataset):
 		wandb_dict["gnorm-" + ".".join(key)] = value.value.mean()
 
 	wandb.log(wandb_dict)
-	print(f"[{i}] Test loss: {float(t_loss):.2f}, Train loss: {float(mean_loss):.2f}, Std loss: {float(std_loss):.2f}, Effective batch size: {n:.1f}, Learning rate: {lr / n:.2e}, Momentum: {1 - 1/n:.2f}")
+	print(f"[{i}] Train loss: {float(mean_loss):.2f}, Std loss: {float(std_loss):.2f}, Effective batch size: {n:.1f}, Learning rate: {lr / n:.2e}, Momentum: {1 - 1/n:.2f}")
 	if np.isnan(mean_loss):
 		print("Loss is NaN, stopping training...")
 		break
